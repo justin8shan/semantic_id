@@ -2,7 +2,7 @@
 
 **Scope:** Build stable, cold-start-robust semantic IDs for a ~4M-SKU sports-merchandise catalog from precomputed 128-d product embeddings, for use (a) as ranker features and (b) as an optional generative-retrieval target.
 
-**Status:** Draft for review (rev 5). Open decisions flagged inline and collected in §13.
+**Status:** Draft for review (rev 6). Open decisions flagged inline and collected in §13.
 
 **Known catalog shape:** ~4M SKUs · 128-d embeddings · 130 leagues · up to 1,131 teams in a single league (College) · 33 departments.
 
@@ -28,7 +28,7 @@ The binding design constraint is **not** the 4M total — it is the **skew of th
 | D2 | Where co-click signal goes | Ranker features + evaluation, **not** baked into the ID | Different roles; keeps ID stable. §3.3 |
 | D3 | Taxonomy (`league`/`team`/`dept`) | **Fold into the embedding**, keep columns as separate filter metadata | Preserves cross-team style similarity; cardinalities fit comfortably; taxonomy stays available for filtering. §4 |
 | D4 | Quantizer | RQ-VAE (residual-quantized VAE) | Learned, balanced, coarse-to-fine codes. §7 |
-| D5 | Codebook shape | **Width 512, depth 3**, latent dim 32, + 1 collision-breaker token | ~7,800 items/code at L1; sized by items-per-code, tuned by measured utilization. §5–6 |
+| D5 | Codebook shape | **Width 512, depth 3**, latent dim 32, + 1 collision-breaker token | ~7,800 items/code at L1; sized by items-per-code, tuned by measured utilization. §5–6, `hyperparameter_tuning.md` |
 | D6 | ID stability | Freeze quantizer across retrains; version via `embedding_set_version`; explicit remap policy | Prevents silent ID reshuffling in production. §9 |
 
 ---
@@ -61,8 +61,9 @@ The `content_embedding` is fixed for the life of the SKU and available at full f
 ### 3.3 Where the co-click signal goes instead (D2)
 
 1. **Ranker features** — the co-click signal enters the ranker as a projected `hybrid_embedding` beside the semantic-ID token embeddings, so the ranker leans on behavior where it exists and on content-derived codes where it doesn't (feature spec in §12).
-2. **Evaluation ground truth** — `hybrid_similar_products` / `site_hybrid_similar_products` validate that ID prefixes are behaviorally coherent (§11).
-3. **Optional coarse refinement** — if behavior is ever wanted in the ID, inject only at the slow-moving team/dept grain, never per-item. Out of scope for v1.
+2. **Optional coarse refinement** — if behavior is ever wanted in the ID, inject only at the slow-moving team/dept grain, never per-item. Out of scope for v1.
+
+(The semantic ID itself is *evaluated* against taxonomy, not the hybrid embedding — see §11.)
 
 ---
 
@@ -124,7 +125,7 @@ This is the full set of knobs for the construction job, grouped, with the decisi
 | `W` (codebook width) | 512 **[set/tune]** | Items-per-code band: floor `W^L ≫ 4M`; ceiling `N/W` in a healthy range (~7.8k/code at L1 — enough signal per code, not so wide codes go dead). Cardinalities confirm 512 ≥ 130 leagues. Tune down if utilization is low. |
 | `L` (learned depth) | 3, → 4 if needed **[set/tune]** | Capacity + hot-bucket utilization + downstream use. Each level adds capacity but, for generative retrieval, is another decode step; for ranking it's a cheap extra table. Add a level only if hot buckets collide at depth 3. |
 | `d` (latent / codeword dim) | 32 **[set/tune]** | Bottleneck **below** `d_in=128` to force semantic compression (the summed codewords `ẑ ∈ R^d` must reconstruct the 128-d input). Raise to 64 if reconstruction plateaus too high; lower if codes are underused. |
-| `n_dedup` (collision token) | sized to max bucket occupancy **[tune]** | Set from the observed worst-case `(c1,c2,c3)` bucket after assignment; assigned deterministically (§8 step 6). Per-level width taper is a related lever, kept in §6.5 Tier 3. |
+| `n_dedup` (collision token) | sized to max bucket occupancy **[tune]** | Set from the observed worst-case `(c1,c2,c3)` bucket after assignment; assigned deterministically (§8 step 6). Per-level width taper is a related lever — see `hyperparameter_tuning.md`. |
 
 ### 6.3 Training parameters (RQ-VAE optimization)
 
@@ -139,49 +140,11 @@ This is the full set of knobs for the construction job, grouped, with the decisi
 | `sample_size` + stratification | few-M sample, **oversample hot buckets** **[set]** | Codebooks must see hot-bucket density or they tune to the long tail; stratify on `(league, team)` and `is_hot_market`. |
 | straight-through estimator | on **[structural]** | Required to pass gradient through the non-differentiable `argmin`; not optional. |
 
-### 6.4 The sizing decision procedure (how `W`, `L`, `d` are actually chosen)
+### 6.4 Sizing procedure & sweep plan → companion doc
 
-1. **Floor.** Require `W^L ≥ ~10×` the largest expected `(league, team)` item bucket (and comfortably ≥ 4M globally). Capacity alone does not rule out 256³ (16.7M clears 4M at ~4×).
-2. **Ceiling.** Require items-per-code `N/W` in roughly the low-thousands so each codeword gets enough examples to learn a stable centroid. This is what rules out 256³ (L1 too coarse at ~15,600 items/code) and very wide `W` (too sparse).
-3. **Pick inside the band** → 512×3, `d`=32.
-4. **Train, then measure** (§11): per-level dead-code rate, usage entropy / effective codebook size, collision-bucket sizes — **globally and inside the top hot buckets**.
-5. **Adjust — canonical rule (referenced elsewhere):** dead codes / low entropy → smaller `W` or stronger init/reset; collisions in a hot bucket → `L`→4; reconstruction too high → raise `d`.
-6. **Freeze** the chosen artifact and version it (§9).
+The step-by-step procedure for *choosing* `W`, `L`, `d` (the floor/ceiling bounds, the canonical adjust rules, the tunable-vs-fixed classification, and the 7-run sweep sequence) lives in the companion file **`hyperparameter_tuning.md`** to keep this doc focused on *what* the parameters are rather than *how* they're swept. In brief: start at `W=512, L=3, d=32`; grid `{256,512,1024} × {3,4}` at `d=32`, then one `d=64` run on the winner; select the smallest configuration that clears the §11 hot-bucket diagnostics.
 
-Everything in 6.2–6.3 is chosen once per `semantic_id_version` and then frozen; only the *downstream* model's code-embedding tables keep training (§12).
-
-### 6.5 Tunable parameters & sweep plan
-
-Of the parameters in 6.1–6.3, only a subset is worth *sweeping*. The rest are fixed by the data, by the architecture, or by a design decision, and burning sweep budget on them is wasted. This section separates them and gives the sweep order.
-
-**Tier 1 — shape the ID (primary sweep).** These change the code space itself, so they come first. `W` and `L` jointly set both capacity (`W^L`) and items-per-code, so sweep them as a **grid, not one-at-a-time**; `d` interacts weakly and is swept after.
-
-| Param | Values to try | Trades | Signal to move it |
-|-------|---------------|--------|-------------------|
-| `W` — codebook width | 256 / **512** / 1024 | resolution vs items-per-code density | low usage entropy or dead codes → shrink; collisions → widen |
-| `L` — learned depth | **3** / 4 | capacity + prefix granularity vs sequence length & per-code sparsity | hot-bucket collisions at depth 3 → 4 |
-| `d` — latent / codeword dim | **32** / 64 | reconstruction fidelity vs how compressed/semantic the codes are (must stay below `d_in=128` to remain a bottleneck) | reconstruction plateaus high → raise; codes underused → lower |
-
-**Tier 2 — training dynamics (nudge only if diagnostics are bad).** Not swept for quality; changed only when utilization/collapse diagnostics look wrong.
-
-| Param | Default | Range | When to change |
-|-------|---------|-------|----------------|
-| `beta` — commitment weight | 0.25 | 0.1–2.0 | codebook usage unstable / commitment loss dominates |
-| `gamma` — EMA decay | 0.99 | 0.95–0.999 | codebooks too sluggish (lower) or jittery (raise) |
-| `dead_code_reset` threshold + freq | on | — | dead-code count stays high despite k-means init |
-| `lr` / `batch_size` / `epochs` | 1e-3 / ~4096 / plateau | standard | rough or non-converging reconstruction curve |
-
-**Tier 3 — data-side (matters for the skew).** Easy to forget; a real lever given the College-scale skew.
-
-| Param | Default | Why tunable here |
-|-------|---------|------------------|
-| hot-bucket oversampling ratio | oversample | sample composition directly changes whether hot buckets get enough codebook capacity |
-| training sample size | few-M | larger improves codebook stability up to a point |
-| per-level width taper | uniform 512 (or 512/512/256) | shift capacity to coarse levels if fine residuals are low-variance |
-
-**Not tunable (do not sweep):** `d_in=128` (given); `source_embedding=content_embedding` (design decision, §3); straight-through estimator, EMA-vs-gradient, k-means init (structural, always on); `n_dedup` and the collision-ordering key (data-determined / fixed-deterministic, §8 step 6); L2 normalization (fixed — lock early, changing it re-derives everything).
-
-**Sweep sequence (phase-1 prototype).** Fix Tiers 2–3 at defaults → grid over `W × L` at `d=32` (6 runs: {256,512,1024} × {3,4}) → read the §11 diagnostics **inside the hot buckets** → one added run at `d=64` on the chosen `W×L` (`d=32` is already in the grid) → lock. **7 runs total** to settle the ID space. Selection rule: smallest `(W, L, d)` whose hot-bucket utilization and collision diagnostics (§11) clear their thresholds — smaller is better for serving/decoding, so stop at the first configuration that passes rather than maximizing a score.
+Everything in 6.1–6.3 is chosen once per `semantic_id_version` and then frozen; only the *downstream* model's code-embedding tables keep training (§12).
 
 ---
 
@@ -229,7 +192,7 @@ New SKU (`is_hot_market=true`, small `launch_age_bucket`): its 128-d `content_em
 
 ## 11. Evaluation plan
 
-Four intrinsic metric families (computed from the assignment output alone, plus the schema's behavioral neighbor lists) and one downstream test. For each: the inputs, the computation, and the pass rule. Notation: `N` = number of products; for level `ℓ`, code `cℓ(i)` is product `i`'s code, and `usage[ℓ][k] = |{ i : cℓ(i) = k }|` is the count of products assigned to code `k` at level `ℓ`.
+Four intrinsic metric families (computed from the assignment output plus the taxonomy columns) and one downstream test. For each: the inputs, the computation, and the pass rule. All intrinsic metrics are ground-truthed on the catalog's own taxonomy (`league`/`team`/`merch_class_leaf`), **not** on the hybrid embedding or its neighbor lists — the semantic ID is built from content alone, so it is judged against content/taxonomy structure. Notation: `N` = number of products; for level `ℓ`, code `cℓ(i)` is product `i`'s code, and `usage[ℓ][k] = |{ i : cℓ(i) = k }|` is the count of products assigned to code `k` at level `ℓ`.
 
 ### 11.1 Codebook utilization (per level; global and per hot bucket)
 
@@ -245,7 +208,7 @@ Four intrinsic metric families (computed from the assignment output alone, plus 
 
 > **Scope caveat (important).** `U_ℓ` is only meaningful when `|S| ≫ W`: at most `min(W, |S|)` codes can be non-empty, so a scope with `|S| < W` is capped at `U_ℓ ≤ |S|/W < 1` no matter how good the assignment is (e.g. a 200-SKU bucket can never exceed `200/512 ≈ 0.39`). Therefore apply the `U_ℓ` pass rule **only to scopes with `|S| ≥ 4W`** (the global set always qualifies; a "hot bucket" qualifies by construction since it is large by definition). For smaller buckets, judge on dead-code rate and `M_ℓ` alone, or report `PPL_ℓ / min(W, |S|)` instead of `PPL_ℓ / W`.
 
-**Pass rule (per level):** for scopes with `|S| ≥ 4W`: `U_ℓ ≥ 0.5` **and** dead-code rate `≤ 0.10` **and** `M_ℓ ≤ 10 × (1/W)` (no code more than ~10× its fair share); for smaller scopes, dead-code rate and `M_ℓ` only. Check **globally and inside the top-K hot buckets** — the skew fails the per-bucket test first, so the per-bucket check is the binding one. Failing → apply the §6.4 step 5 canonical adjust-rule (shrink `W` / strengthen init / raise dead-code-reset frequency).
+**Pass rule (per level):** for scopes with `|S| ≥ 4W`: `U_ℓ ≥ 0.5` **and** dead-code rate `≤ 0.10` **and** `M_ℓ ≤ 10 × (1/W)` (no code more than ~10× its fair share); for smaller scopes, dead-code rate and `M_ℓ` only. Check **globally and inside the top-K hot buckets** — the skew fails the per-bucket test first, so the per-bucket check is the binding one. Failing → apply the canonical adjust rules in `hyperparameter_tuning.md` (shrink `W` / strengthen init / raise dead-code-reset frequency).
 
 ### 11.2 Collision rate
 
@@ -258,38 +221,41 @@ Four intrinsic metric families (computed from the assignment output alone, plus 
 - **Worst-case bucket** = `max_t bucket[t]` — sets the required `n_dedup` width.
 - **Bucket-size distribution** — percentiles (p50/p90/p99/max) of `bucket[t]`; report **globally and per hot bucket**.
 
-**Pass rule:** worst-case bucket small enough that a modest `dedup` token covers it (target `max_t bucket[t] ≲ a few hundred`), and the hot-bucket p99 not materially worse than global p99. Rising hot-bucket collisions → `L`→4 (§6.5). Note: collisions are *broken* by the dedup token regardless, so this metric gauges ID *quality/resolution*, not correctness.
+**Pass rule:** worst-case bucket small enough that a modest `dedup` token covers it (target `max_t bucket[t] ≲ a few hundred`), and the hot-bucket p99 not materially worse than global p99. Rising hot-bucket collisions → `L`→4 (adjust rules in `hyperparameter_tuning.md`). Note: collisions are *broken* by the dedup token regardless, so this metric gauges ID *quality/resolution*, not correctness.
 
-### 11.3 Prefix coherence vs behavior (ground-truthed)
+### 11.3 Taxonomy–prefix alignment (ground-truthed on league/team)
 
-Tests whether content-derived codes recovered *behavioral* structure — the thing we traded away in D1. Uses the schema's precomputed neighbor lists as ground truth.
+Tests the property we actually want from folding (§4): **do products in the same league/team share a semantic-ID prefix?** If the content embedding carries team structure the way we claim, same-team products should collide on their coarse codes far more than chance. This replaces any behavior-based check — it uses only the taxonomy columns.
 
-**Inputs:** for each anchor `i`, its behavioral neighbor list `Neigh(i)` from `hybrid_similar_products` (or the per-site list under `site_hybrid_similar_products`), optionally top-`n` by `score`; and all products' tuples.
+**Inputs:** the assigned tuples + the `league` and `team` columns.
 
-**Computation** — define shared-prefix length `spl(i, j)` = the number of leading levels on which `i` and `j` agree (0 if `c1` differs, 1 if only `c1` matches, 2 if `c1,c2` match, 3 if the full learned tuple matches). Then over a sample of anchors `A`:
+**Computation** — for a taxonomy field `G ∈ {league, team}` and prefix length `ℓ ∈ {1, 2, 3}`, work from prefix-bucket counts. Within one taxon value `g` (e.g. a specific team), let `n_g` = number of products in `g` and `n_{g,p}` = number of those whose length-`ℓ` prefix is `p`. Then:
 
-- **Prefix-match rate at level `ℓ`** `PM_ℓ = mean over i∈A of ( |{ j ∈ Neigh(i) : spl(i,j) ≥ ℓ }| / |Neigh(i)| )` — the average fraction of an item's behavioral neighbors that share at least its first `ℓ` codes, for `ℓ = 1, 2, 3`.
-- **Mean shared-prefix length** `MSPL = mean over i∈A, j∈Neigh(i) of spl(i,j)` — a single scalar; higher = behavioral neighbors sit closer in code space.
-- **Baseline (required for interpretation):** recompute `PM_ℓ` against **random** neighbor lists of the same length. Report **lift** `PM_ℓ / PM_ℓ^random`. Raw `PM_ℓ` is meaningless without this baseline because large buckets inflate chance agreement.
+- **Within-taxon prefix-share probability** — the chance two random products in `g` share their length-`ℓ` prefix:
+  `share_g(ℓ) = Σ_p n_{g,p} · (n_{g,p} − 1) / ( n_g · (n_g − 1) )` (the Simpson/Herfindahl collision probability of the prefix distribution inside `g`).
+- **Aggregate** over taxa, weighted by size (equivalently: pick a random product, then a random other product in its taxon, ask if they share the `ℓ`-prefix):
+  `SharePrefix(G, ℓ) = Σ_g [ n_g / N ] · share_g(ℓ)`. Report for `ℓ = 1, 2, 3`, for `G = league` and `G = team`.
+- **Chance baseline** — the global prefix-collision probability ignoring taxonomy: `base(ℓ) = Σ_p (n_p / N)²` where `n_p` = catalog-wide count of products with length-`ℓ` prefix `p`. Report **lift** `SharePrefix(G, ℓ) / base(ℓ)`; the raw probability alone is uninterpretable because coarse prefixes are common by construction.
+- **(Optional, reverse view) prefix purity** — for each length-`ℓ` prefix bucket, the fraction of members sharing the bucket's modal `team`; averaged over buckets weighted by size. High purity means "same prefix ⇒ same team," the converse direction.
 
-**Pass rule:** `PM_ℓ` decreasing in `ℓ` (expected — fewer neighbors share longer prefixes) but **lift over random ≫ 1 at every level**, and lift *growing* with `ℓ` (behavioral neighbors concentrate at longer shared prefixes). This is the metric that quantifies the D1 content-vs-hybrid tradeoff; a low lift here is the signal to reconsider injecting coarse behavioral signal (§3.3).
+**Pass rule:** `SharePrefix(team, ℓ)` well above `base(ℓ)` at every level with **lift ≫ 1**, largest at `ℓ=1` (team should be captured by the coarse codes) and still > 1 at `ℓ=2,3`; `SharePrefix(league, 1)` lift ≥ `SharePrefix(team, 1)` lift is expected (league is coarser). A weak team lift at `ℓ=1` means the coarse codes are *not* absorbing team structure — the signal to reconsider a hard `league`/`team` prefix instead of folding (§4 alternative).
 
 ### 11.4 Cold-start placement quality
 
-**Inputs:** a hold-out of recent launches (small `launch_age_bucket` / `is_hot_market=true`); their assigned tuples; taxonomy columns; and, once history exists, their later-materialized `hybrid_similar_products`.
+**Inputs:** a hold-out of recent launches (small `launch_age_bucket` / `is_hot_market=true`); their assigned tuples; taxonomy columns.
 
 **Computation** — for each held-out cold item `i`, take its tuple-mates `TM(i) = { j : t(j) = t(i), j ≠ i }` (or first-two-level prefix-mates if `TM(i)` is small):
 
-- **Taxonomy purity** `mean over i of ( fraction of TM(i) sharing i's team )` and likewise for `merch_class_leaf`. High purity = the cold item landed among genuinely related products from content alone.
-- **Deferred behavioral recall** — after the item accumulates history (e.g. 2–4 weeks), `mean over i of ( |TM(i) ∩ Neigh_later(i)| / |Neigh_later(i)| )` — did its at-launch code-neighbors turn out to be its eventual behavioral neighbors? Compare against the random baseline as in 11.3.
+- **Taxonomy purity** `mean over i of ( fraction of TM(i) sharing i's team )`, and likewise for `merch_class_leaf`. High purity = the cold item landed among genuinely related products from content alone, with no interaction history.
+- **Baseline** — compare against the global rate at which two random products share `team` (`Σ_g (n_g/N)²` over teams); report the lift.
 
-**Pass rule:** taxonomy purity high (cold items are not scattered), and deferred behavioral recall lift ≫ 1 — i.e. the at-launch placement predicted eventual behavior.
+**Pass rule:** taxonomy purity lift ≫ 1 — a freshly launched SKU's code-neighbors are overwhelmingly same-team / same-class, confirming the at-launch placement is meaningful before any behavior exists.
 
 ### 11.5 Downstream (decisive) test
 
 Ranker offline **NDCG@k / Recall@k** with vs without the semantic-ID features, on the same training/eval split, **sliced by `launch_age_bucket` and `is_hot_market`**. Report per-slice deltas, not just the aggregate. Expected signature: neutral-to-positive on dense head slices, clearly positive on cold/long-tail slices — that slice pattern, not the headline number, is what confirms the ID is doing its intended job.
 
-> All intrinsic metrics (11.1–11.4) are computable in the Spark assignment job directly from the output table plus the neighbor-list columns; none requires model training, so they gate the §6.5 sweep cheaply. 11.5 requires a ranker training run and gates promotion, not the sweep.
+> All intrinsic metrics (11.1–11.4) are computable in the Spark assignment job directly from the output table plus the taxonomy columns; none requires model training or the hybrid embedding, so they gate the sweep in `hyperparameter_tuning.md` cheaply. 11.5 requires a ranker training run and gates promotion, not the sweep.
 
 ---
 
@@ -304,8 +270,8 @@ Ranker offline **NDCG@k / Recall@k** with vs without the semantic-ID features, o
 ## 13. Risks & open decisions
 
 - **[Decide] Depth 3 vs 4** — from hot-bucket utilization (§11.1), not up front.
-- **[Decide] Latent `d` = 32 vs 64** — from reconstruction vs utilization tradeoff (§6.4 step 5).
-- **[Decide] Multi-site IDs** — v1 builds one global ID; per-site ID *spaces* out of scope, per-site *evaluation* (§11.3) in.
+- **[Decide] Latent `d` = 32 vs 64** — from reconstruction vs utilization tradeoff (adjust rules in `hyperparameter_tuning.md`).
+- **[Decide] Multi-site IDs** — v1 builds one global ID; per-site ID *spaces* out of scope. (Per-site behavioral neighbor lists exist in the schema but are not used, per the content-only evaluation stance, §11.)
 - **[Risk] Hot-bucket saturation** (College-scale) — mitigated by oversampled training (§8 step 3) + hot-bucket utilization gating (§11.1).
 - **[Risk] ID churn on retrain** — mitigated by freeze + warm-start + dual-write (§9).
 - **[Watch] Customized / drop-ship SKUs** (`is_customized`, `is_drop_ship`) — confirm their content embeddings are meaningful; degenerate vectors distort codebooks.
@@ -314,7 +280,7 @@ Ranker offline **NDCG@k / Recall@k** with vs without the semantic-ID features, o
 
 ## 14. Phased rollout
 
-1. **Prototype** — 512×3, `d`=32 on a stratified sample; utilization + collision + prefix-coherence reports (§11.1–11.3). Settle depth and `d`. (Cold-start placement §11.4: its taxonomy-purity half runs now; the deferred-behavioral-recall half needs 2–4 weeks of post-launch history and lands in phase 3.)
+1. **Prototype** — 512×3, `d`=32 on a stratified sample; utilization + collision + taxonomy–prefix alignment + cold-start placement reports (§11.1–11.4, all taxonomy-grounded, no model training). Settle depth and `d` per `hyperparameter_tuning.md`.
 2. **Full assignment** — batch-assign 4M; publish IDs + versions; stand up frozen-encoder ingestion (§10).
 3. **Ranker integration** — add per-level code-embedding tables; measure lift sliced by cold-start/long-tail.
 4. **Stability hardening** — dual-write + warm-start retrain runbook.
@@ -322,4 +288,4 @@ Ranker offline **NDCG@k / Recall@k** with vs without the semantic-ID features, o
 
 ---
 
-*Appendix — schema fields by role.* Quantization input: `content_embedding` (128-d). Behavior (features/eval, not ID): `hybrid_embedding`, `hybrid_similar_products`, `site_hybrid_similar_products` (and the `effective_gate` / `neighbor_embedding` / `content_embedding` that define the score-weighted hybrid blend). Folded into embedding + kept as filter metadata: `league`, `team`, `brand`, `merch_class_root`, `merch_class_leaf`, `dept_names`, `subdept_names`, `classification_levels`, `player_names`, `color`, `color_style`, `price_band`, `age_group`, `gender`, `gender_age_groups`, `is_customized`, `is_drop_ship`, `on_sale`, `coupon_eligible`. Cold-start stratification: `is_hot_market`, `launch_age_bucket`. Versioning/temporal: `embedding_set_id`, `embedding_set_version`, `produced_at`, `valid_from`, `valid_to`. Key: `product_id`. Display/debug: `product_name`, `style_name`.
+*Appendix — schema fields by role.* Quantization input: `content_embedding` (128-d). Ranker feature only (not the ID, not ID evaluation): `hybrid_embedding` (and the `effective_gate` / `neighbor_embedding` / `content_embedding` that define its score-weighted blend). Available but unused in v1: `hybrid_similar_products`, `site_hybrid_similar_products` (behavioral neighbor lists — the ID is evaluated against taxonomy, not behavior, §11). Folded into embedding + kept as filter metadata: `league`, `team`, `brand`, `merch_class_root`, `merch_class_leaf`, `dept_names`, `subdept_names`, `classification_levels`, `player_names`, `color`, `color_style`, `price_band`, `age_group`, `gender`, `gender_age_groups`, `is_customized`, `is_drop_ship`, `on_sale`, `coupon_eligible`. Evaluation ground truth: `league`, `team`, `merch_class_leaf`. Cold-start stratification: `is_hot_market`, `launch_age_bucket`. Versioning/temporal: `embedding_set_id`, `embedding_set_version`, `produced_at`, `valid_from`, `valid_to`. Key: `product_id`. Display/debug: `product_name`, `style_name`.

@@ -1,0 +1,15 @@
+# Core runtime dependencies for the semantic_id pipeline.
+# Versions pinned to what was actually installed and verified in this repo's
+# dev environment (torchrec conda env, Python 3.10.13) — see README.md.
+torch==2.1.2
+polars==1.44.2
+numpy==1.26.3
+PyYAML==6.0.1
+fsspec==2023.10.0
+
+# Needed by fsspec for s3:// artifact reads/writes in train/artifact.py and
+# io_utils.py (Polars' own parquet I/O has a separate, built-in S3 reader and
+# doesn't need this) — only required for real runs against the S3 input/output
+# paths in configs/default.yaml. Not installed/verified in this repo's dev
+# sandbox (no S3 network access there); pin loosely and verify on first real run.
+s3fs>=2023.10.0

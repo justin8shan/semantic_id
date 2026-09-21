@@ -1,0 +1,56 @@
+# Semantic ID pipeline configuration.
+# All paths/hyperparameters live here; every CLI accepts --config plus
+# dotted overrides (e.g. --set quantizer.W=1024) for the hyperparameter_tuning.md sweep.
+
+data:
+  # Full parquet path, read as-is: the source table carries no version/date
+  # columns to filter on.
+  input_path: "s3://fanatics.prod.internal.confidential/xshan/semantic_id/input/product_emb/"
+  output_path: "s3://fanatics.prod.internal.confidential/xshan/semantic_id/output/"
+  embedding_dim: 128
+  # Manually-set provenance tag for this input snapshot (the source table has
+  # no embedding_set_version column of its own) — carried through to the
+  # published output and the training artifact (design-doc §9).
+  embedding_set_version: "product_emb-v1"
+
+preprocess:
+  val_fraction: 0.10
+  split_seed: 42
+  # Stratification key for the train/val split — every (league, team) bucket
+  # is split independently so long-tail buckets appear in both splits.
+  strata_columns: ["league", "team"]
+
+weighting:
+  hot_bucket_top_k: 20          # top-K (league, team) buckets by SKU count
+  hot_bucket_weight: 5.0        # sample-weight multiplier for rows in a hot bucket
+  hot_market_weight: 5.0        # sample-weight multiplier for is_hot_market=true rows
+  # multipliers combine multiplicatively when a row satisfies both
+
+quantizer:
+  W: 512                        # codebook width per level
+  L: 3                          # residual quantizer depth
+  d: 32                         # latent / codeword dim (must stay below embedding_dim)
+  beta: 0.25                    # commitment loss weight
+  gamma: 0.99                   # EMA codebook decay
+  kmeans_init: true
+  dead_code_reset: true
+  dead_code_reset_threshold: 0.01   # usage fraction below which a code is considered dead
+  dead_code_reset_every: 1          # epochs between dead-code reset passes
+
+training:
+  lr: 1.0e-3
+  batch_size: 4096
+  max_epochs: 200
+  patience: 10                  # epochs without val-plateau improvement before stopping
+  min_delta: 1.0e-4
+  seed: 42
+  device: "cpu"
+  warm_start_from: null         # optional path to a prior artifact's codebooks
+
+versioning:
+  semantic_id_version: "v1"
+  # embedding_set_version lives under `data` (see above) — it's a manually-set
+  # input-snapshot tag, not read from the data itself.
+
+eval:
+  hot_bucket_top_k: 20          # should match weighting.hot_bucket_top_k

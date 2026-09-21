@@ -1,0 +1,4 @@
+# Adds test tooling on top of the runtime dependencies.
+-r requirements.txt
+
+pytest==7.4.4

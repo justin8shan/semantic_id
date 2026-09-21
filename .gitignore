@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+*.egg-info/
+.venv/
+
+# Local data/model artifacts (multi-GB) — never commit these.
+data/
+.claude/
+.vscode/

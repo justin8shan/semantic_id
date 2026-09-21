@@ -1,0 +1,46 @@
+# Local-run variant of default.yaml: same hyperparameters, but input/output
+# point at local parquet files instead of S3 (no AWS access needed).
+# Usage: pass --config configs/local.yaml to any CLI instead of default.yaml.
+
+data:
+  input_path: "/Users/xshan/gitme/semantic_id/data/input/product_emb/"
+  output_path: "/Users/xshan/gitme/semantic_id/data/output/"
+  embedding_dim: 128
+  embedding_set_version: "product_emb-local-v1"
+
+preprocess:
+  val_fraction: 0.10
+  split_seed: 42
+  strata_columns: ["league", "team"]
+
+weighting:
+  hot_bucket_top_k: 20
+  hot_bucket_weight: 5.0
+  hot_market_weight: 5.0
+
+quantizer:
+  W: 512
+  L: 3
+  d: 32
+  beta: 0.25
+  gamma: 0.99
+  kmeans_init: true
+  dead_code_reset: true
+  dead_code_reset_threshold: 0.01
+  dead_code_reset_every: 1
+
+training:
+  lr: 1.0e-3
+  batch_size: 4096
+  max_epochs: 200
+  patience: 10
+  min_delta: 1.0e-4
+  seed: 42
+  device: "cpu"
+  warm_start_from: null
+
+versioning:
+  semantic_id_version: "local-v1"
+
+eval:
+  hot_bucket_top_k: 20

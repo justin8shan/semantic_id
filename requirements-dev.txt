@@ -2,3 +2,6 @@
 -r requirements.txt
 
 pytest==7.4.4
+
+# Inspector app UI (inspector/app.py) — not needed for the pipeline itself or its tests.
+streamlit==1.39.0

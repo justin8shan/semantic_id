@@ -23,11 +23,12 @@ pip install -r requirements.txt
 
 ```bash
 export PYTHONPATH="$(pwd):$PYTHONPATH"
-python -m pytest tests/
+python -m pytest
 ```
 
 (`pyproject.toml` adds the repo root to `pythonpath` so `semantic_id` imports
-resolve without an install step.)
+resolve without an install step, and sets `testpaths` to both `tests/` and
+`inspector/test/`.)
 
 ### Local smoke run (synthetic data, no S3 needed)
 
@@ -101,6 +102,39 @@ under, so results are directly comparable across the sweep. Pick the smallest
 configuration whose hot-bucket utilization and collision diagnostics clear
 the §11 thresholds (`passes: true`) — see the "Selection rule" in
 `hyperparameter_tuning.md`.
+
+## Inspector
+
+`inspector/` is a read-only Streamlit app for interrogating a published
+assignment — answers three questions day-to-day, against
+`data/output/product_id_semantic_id_full_mapping.parquet` by default:
+
+1. **Product ID → semantic ID** — codes per level, dedup slot, bucket size,
+   and metadata.
+2. **Semantic ID / prefix → product IDs** — every product sharing a full ID
+   or a leading `c1..ck` prefix.
+3. **Compare two products** — semantic ID, metadata agreement, shared-prefix
+   depth, and `content_embedding` cosine similarity.
+
+The cosine comparison needs a one-time embedding index (a memmap over
+`content_embedding`, built with the same validity filter + L2 normalization
+`batch_assign.py` uses, so the Inspector sees exactly what the quantizer saw):
+
+```bash
+pip install -r requirements-dev.txt          # adds streamlit on top of the pipeline deps
+python inspector/build_embedding_index.py    # writes data/inspector_index/ (~1.6GB for the full catalog)
+streamlit run inspector/app.py
+```
+
+Override the mapping/embedding/index paths (e.g. to inspect a sweep version) via
+`SEMANTIC_ID_INSPECTOR_MAPPING` / `SEMANTIC_ID_INSPECTOR_EMBEDDINGS` /
+`SEMANTIC_ID_INSPECTOR_INDEX`, or the builder's `--embedding-source` /
+`--index-dir` flags. `inspector/build_full_mapping.py` joins any other
+`semantic_id_version`'s tokens-only assignments against the source catalog's
+metadata, producing a mapping file in the same shape, so a swept config can be
+pointed at without re-running the pipeline. The core query functions
+(`inspector/core.py`) have no Streamlit dependency and are covered by
+`inspector/test/test_core.py`.
 
 ## What's not built here
 
